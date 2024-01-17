@@ -1,7 +1,8 @@
-package utils
+package raft
 
 import (
 	"github.com/hhr12138/Konata/src/consts"
+	"github.com/hhr12138/Konata/src/utils"
 	"testing"
 )
 
@@ -29,10 +30,12 @@ func TestLock(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ShowLockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
-			Lock(tt.args.targetLocks)
-			Unlock(tt.args.targetLocks)
-			ShowUnlockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
+			locks := Locks{}
+			locks.initLocks()
+			utils.ShowLockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
+			locks.Lock(tt.args.targetLocks)
+			locks.Unlock(tt.args.targetLocks)
+			utils.ShowUnlockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
 		})
 	}
 }
