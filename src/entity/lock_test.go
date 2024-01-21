@@ -1,4 +1,4 @@
-package raft
+package entity
 
 import (
 	"github.com/hhr12138/Konata/src/consts"
@@ -31,11 +31,11 @@ func TestLock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			locks := Locks{}
-			locks.initLocks()
-			utils.ShowLockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
+			locks.InitLocks()
+			utils.ShowLockLog(consts.INFO, "raft0", 1, 1, "[test]",tt.args.targetLocks)
 			locks.Lock(tt.args.targetLocks)
 			locks.Unlock(tt.args.targetLocks)
-			utils.ShowUnlockLog(consts.INFO, "raft0", 1, 1, tt.args.targetLocks)
+			utils.ShowUnlockLog(consts.INFO, "raft0", 1, 1, "[test]", tt.args.targetLocks)
 		})
 	}
 }

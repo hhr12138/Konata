@@ -1,4 +1,4 @@
-package raft
+package entity
 
 import (
 	"github.com/hhr12138/Konata/src/consts"
@@ -8,7 +8,7 @@ import (
 
 type Locks map[consts.LockName]*sync.Mutex
 
-func (locks Locks) initLocks(){
+func (locks Locks) InitLocks(){
 	utils.DPrintf("lock init")
 	for _, name := range consts.LockOrder {
 		if _, ok := locks[name]; ok {

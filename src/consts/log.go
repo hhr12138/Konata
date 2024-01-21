@@ -13,3 +13,8 @@ const (
 	ERROR LogLevel = "ERROR"
 	FATAL LogLevel = "FATAL"
 )
+
+const(
+	NULL_CAN = -1
+	NULL_OFFSET = -1
+)
