@@ -6,6 +6,8 @@ import (
 	"github.com/hhr12138/Konata/src/entity"
 	"github.com/hhr12138/Konata/src/labrpc"
 	"github.com/hhr12138/Konata/src/utils"
+	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,8 +32,6 @@ import (
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -63,18 +63,17 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	term    int          // 任期
-	status consts.Status // 状态
-	lockMap entity.Locks // 所有锁控制
-	logs []*entity.Log // 日志
-	voteFor int // 投票给谁
-	electionTime atomic.Value // 选举超时
-	applyCh chan ApplyMsg
-	nextIndex []int
-	matchIndex []int
-	commitIndex int32
-	lastApplied int32
-
+	term         int           // 任期
+	status       consts.Status // 状态
+	lockMap      entity.Locks  // 所有锁控制
+	logs         []*entity.Log // 日志
+	voteFor      int           // 投票给谁
+	electionTime atomic.Value  // 选举超时
+	applyCh      chan ApplyMsg
+	nextIndex    []int
+	matchIndex   []int
+	commitIndex  int32
+	lastApplied  int32
 }
 
 // return currentTerm and whether this server
@@ -107,7 +106,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -130,19 +128,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term int
-	candidateId int
-	lastLogIndex int
-	lastLogTerm int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -151,8 +146,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -160,81 +155,216 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	var (
+		term         = 0
+		lastLogIndex = -1
+		lastLogTerm  = -1
+		idx          = 0
+	)
+	locks := utils.GetLockMap(consts.TERM, consts.LOG)
+	rf.lockMap.Lock(locks)
+	defer rf.lockMap.Unlock(locks)
+	term, ok := rf.overdueReqCheck(args.Term)
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] 收到来自%v的投票请求", rf.getEndName(args.CandidateId))
+	reply.Term = term
+	reply.VoteGranted = false
+	if !ok {
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] %v任期过低,对方任期为%v", rf.getEndName(args.CandidateId), args.Term)
+		return
+	}
+	idx = rf.getLogLen() - 1
+	if idx > 0 {
+		lastLogIndex = rf.logs[idx].Index
+		lastLogTerm = rf.logs[idx].Term
+	}
+	if rf.voteFor != consts.NULL_CAN && rf.voteFor != args.CandidateId {
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] 收到来自%v的投票请求,自身在当前任期已为%v投票", rf.getEndName(args.CandidateId), rf.voteFor)
+		return
+	}
+	if args.LastLogTerm < lastLogTerm || args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex {
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] %v日志过旧,对方lastLogTerm为%v,lastLogIndex为%v", rf.getEndName(args.CandidateId), args.LastLogTerm, args.LastLogIndex)
+		return
+	}
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] 为%v投票", rf.getEndName(args.CandidateId))
+	rf.voteFor = args.CandidateId
+	reply.VoteGranted = true
 }
 
 type RequestAppendArgs struct {
-	term int
-	leaderId int
-	prevLogIndex int
-	prevLogTerm int
-	entries []*entity.Log
-	leaderCommit int32
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []*entity.Log
+	LeaderCommit int32
 }
 
 type RequestAppendReply struct {
-	term int
-	success bool
+	Term      int
+	Success   bool
+	NextIndex int
+	LogTerm   int
 }
 
-func (rf *Raft) RequestAppendEntries(args *RequestAppendArgs,reply *RequestAppendReply, slaveId int) {
-	locks := utils.GetLockMap(consts.LOG, consts.STATUS, consts.TERM, consts.NEXT_INDEX)
+func (rf *Raft) SendAppendEntries(slaveId int, oldTerm int) {
+	if slaveId == rf.me {
+		return
+	}
+	reply := new(RequestAppendReply)
+	locks := utils.GetLockMap(consts.LOG, consts.TERM, consts.NEXT_INDEX)
 	rf.lockMap.Lock(locks)
-	var(
-		term = rf.getTerm()
-		status = rf.getStatus()
-		logStartIdx = rf.nextIndex[slaveId]
-		logLen = rf.getLogLen()
+	var (
+		term         = rf.getTerm()
+		logStartIdx  = rf.nextIndex[slaveId]
+		logLen       = rf.getLogLen()
+		offset       = rf.getOffset()
 		prevLogIndex = -1
-		prevLogTerm = -1
+		prevLogTerm  = -1
 	)
-	if logStartIdx > logLen{
-		utils.Printf(consts.ERROR,rf.getEndName(rf.me),term,logLen,"[RequestAppendEntries] 期望的nextIndex>主节点最大偏移量,slaveId=%v",slaveId)
+	if logStartIdx > logLen {
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[RequestAppendEntries] 期望的nextIndex>主节点最大偏移量,slaveId=%v", slaveId)
 		logStartIdx = logLen
 	}
 	appendLogs := rf.logs[logStartIdx:logLen]
-	if logStartIdx > 0{
+	if logStartIdx > 0 {
 		prevLogIndex = rf.logs[logStartIdx-1].Index
 		prevLogTerm = rf.logs[logStartIdx-1].Term
 	}
 	rf.lockMap.Unlock(locks)
-	if rf.killed() || status != consts.LEADER{
+	if rf.killed() || term != oldTerm {
 		return
 	}
 	// appendLogs获取完毕,记得判空,然后接着写
-	args.entries = appendLogs
-	args.term = term
-	args.leaderCommit = rf.getCommitIndex()
-	args.leaderId = rf.me
-	args.prevLogIndex = prevLogIndex
-	args.prevLogTerm = prevLogTerm
+	args := &RequestAppendArgs{
+		Entries:      appendLogs,
+		Term:         term,
+		LeaderCommit: rf.getCommitIndex(),
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+	}
 
 	// 发送RPC
 	success := rf.sendAppendEntries(slaveId, args, reply)
 
 	// 失败直接返回
 	if !success {
+		utils.Printf(consts.WARN, rf.getEndName(rf.me), term, offset, "[SendAppendEntries] RPC失败,slave=%v", rf.getEndName(slaveId))
 		return
 	}
 	// RPC响应检测
-	success = rf.overdueRspCheck(reply.term, term)
-	if !success{
+	success = rf.overdueRspCheckInLock(reply.Term, term)
+	if !success {
 		return
 	}
+	// 尝试修改状态
+	locks = utils.GetLockMap(consts.NEXT_INDEX, consts.MATCH_INDEX, consts.TERM, consts.STATUS)
+	rf.lockMap.Lock(locks)
+	defer rf.lockMap.Unlock(locks)
+	term = rf.term
+	utils.OperationByCAS(term, oldTerm, func() bool {
+		// 同步成功
+		if reply.Success {
+			rf.updateMatchIndex(slaveId, prevLogIndex+len(appendLogs), term)
+			rf.updateNextIndex(slaveId, reply.NextIndex, false)
+		} else if reply.Term > term { // 对方任期更高
+			if !rf.updateStatus(consts.FOLLOWER) {
+				utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[SendAppendEntries] 非法的状态转换,当前状态为%v,目标状态为%v", rf.getStatus(), consts.FOLLOWER)
+				return false
+			}
+			rf.updateTerm(reply.Term)
+		} else { // 发送的nextIndex失败
+			rf.updateNextIndex(slaveId, reply.NextIndex, true)
+		}
+		return true
+	})
+	return
 }
 
 func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply) {
-	term, _, _, _ := rf.getPrimeInfoInLock()
-	// 初始化返回值
-	reply.term = term
-	reply.success = false
-	// 过期请求,直接忽略
-	if !rf.overdueReqCheck(args.term,term){
+	var (
+		term         = 0
+		logLen       = 0
+		logTerm      = -1
+		offset       = 0
+		prevLogTerm  = -1
+		startCopyIdx = 0
+	)
+	locks := utils.GetLockMap(consts.TERM, consts.LOG, consts.LAST_APPLIED)
+	rf.lockMap.Lock(locks)
+	defer rf.lockMap.Unlock(locks)
+	term, ok := rf.overdueReqCheck(args.Term)
+	logLen = rf.getLogLen()
+	offset = rf.getOffset()
+	if offset >= 0 {
+		logTerm = rf.logs[offset].Term
+	}
+	if args.PrevLogIndex < logLen && args.PrevLogIndex >= 0 {
+		prevLogTerm = rf.logs[args.PrevLogIndex].Term
+	}
+	reply.Term = term
+	if !ok {
+		reply.Success = false
 		return
 	}
+
 	// 更新超时时间
+	electionTime := rf.updateElectionTime()
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, consts.NULL_CAN, "[AppendEntries] 收到主节点通信,重置选举超时为%v", electionTime)
 	// 日志判断&追加 2B
+	// prevLogIndex检测
+	if args.PrevLogTerm != prevLogTerm {
+		reply.Success = false
+		if args.PrevLogIndex < logLen {
+			reply.NextIndex = logLen
+			reply.LogTerm = logTerm
+		} else {
+			reply.NextIndex = args.PrevLogIndex
+			reply.LogTerm = prevLogTerm
+		}
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[AppendEntries] 日志冲突,对于idx=%v的日志,参数任期为%v,当前节点日志为%v", args.PrevLogIndex, args.PrevLogTerm, prevLogTerm)
+		return
+	}
+	// 判断是否存在冲突日志
+	for i := 0; i < len(args.Entries) && args.Entries[i].Index < logLen; i++ {
+		if args.Entries[i].Term != rf.logs[args.Entries[i].Index].Term {
+			// 日志冲突,截断
+			rf.logs = rf.logs[:args.Entries[i].Index]
+			utils.Printf(consts.WARN, rf.getEndName(rf.me), term, offset, "[AppendEntries] 在idx=%v出日志冲突,参数任期为%v,当前节点任期为%v,截断", args.Entries[i].Index, args.Entries[i].Term, rf.logs[args.Entries[i].Index].Term)
+			break
+		} else { //存在当前日志，不copy
+			startCopyIdx = i + 1
+		}
+	}
+	// 追加日志
+	rf.logs = append(rf.logs, args.Entries[startCopyIdx:]...)
+	logLen = rf.getLogLen()
+	offset = rf.getOffset()
 	// 修改commitIndex
-	reply.success = true
+	if args.LeaderCommit > rf.getCommitIndex() {
+		atomic.StoreInt32(&rf.commitIndex, args.LeaderCommit)
+	}
+	// 提交日志
+	for i := rf.lastApplied + 1; i <= rf.getCommitIndex(); i++ {
+		if rf.lastApplied > int32(logLen) {
+			utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[AppendEntries] lastApplied > len(log)，len(log)=%v,lastApplied=%v", logLen, rf.lastApplied)
+			break
+		}
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: rf.logs[i].Index,
+		}
+		rf.applyCh <- applyMsg
+		rf.lastApplied = i
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), term, offset, "[AppendEntries] 提交日志%v", applyMsg)
+		// lab3优化下，kv服务器应用该日志后修改lastApplied
+	}
+	reply.Success = true
+	reply.NextIndex = logLen
+	if offset >= 0 {
+		reply.LogTerm = rf.logs[offset].Term
+	}
 	return
 }
 
@@ -273,11 +403,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 // 发送appendEntries
-func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *RequestAppendReply) bool{
-	ok := rf.peers[server].Call("Raft.AppendEntries",args,reply)
+func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *RequestAppendReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -294,14 +423,33 @@ func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *Re
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	var (
+		index  = -1
+		term   = -1
+		status = consts.FOLLOWER
+	)
 
 	// Your code here (2B).
-
-
-	return index, term, isLeader
+	locks := utils.GetLockMap(consts.LOG, consts.TERM)
+	rf.lockMap.Lock(locks)
+	defer rf.lockMap.Unlock(locks)
+	status = rf.getStatus()
+	if status != consts.LEADER || rf.killed() {
+		return index, term, false
+	}
+	term = rf.getTerm()
+	index = rf.getLogLen()
+	rf.appendLog(term, index, command)
+	// 同步日志
+	go func() {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			rf.SendAppendEntries(i, term)
+		}
+	}()
+	return index, term, true
 }
 
 //
@@ -344,10 +492,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.lockMap = make(map[consts.LockName]*sync.Mutex,len(consts.LockOrder))
-	rf.nextIndex = make([]int,len(peers))
-	rf.matchIndex = make([]int,len(peers))
-	rf.logs = make([]*entity.Log,0)
+	rf.lockMap = make(map[consts.LockName]*sync.Mutex, len(consts.LockOrder))
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+	rf.logs = make([]*entity.Log, 0)
+	rf.logs = append(rf.logs, &entity.Log{})
 	rf.electionTime.Store(time.Now())
 
 	rf.lockMap.InitLocks()
@@ -357,65 +506,73 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// 开启心跳检测
-	rf.heartBeat()
+	go rf.heartBeat()
 	return rf
 }
 
 // 通用操作
 // 获取当前任期,偏移量,状态和自身编号等原信息, 不要提供无锁的getPrimeInfoInLock方法
-func (rf *Raft) getPrimeInfoInLock() (term int, status consts.Status, offset,me int, ){
+func (rf *Raft) getPrimeInfoInLock() (term int, status consts.Status, offset, me int) {
 	locks := utils.GetLockMap(consts.TERM, consts.LOG, consts.STATUS)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
 	term = rf.getTerm()
 	status = rf.getStatus()
-	offset = rf.getLogLen()
+	offset = rf.getOffset()
 	me = rf.me
 	return
 }
 
 // 过期RPC请求检查
-func (rf *Raft) overdueReqCheck(argTerm, nowTerm int) bool{
-	if argTerm < nowTerm {
-		return false
-	} else if argTerm > nowTerm{
-		rf.updateTermByCASInLock(argTerm,nowTerm)
+func (rf *Raft) overdueReqCheck(argTerm int) (int, bool) {
+	term := rf.getTerm()
+	if argTerm < term {
+		return term, false
+	} else if argTerm > term {
+		term = argTerm
+		// 对方任期更高，回退为follower并修改任期
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), rf.getTerm(), consts.NULL_OFFSET, "[overdueRspCheck] 收到高任期请求,回退为follower,修改任期为:%v", argTerm)
+		if !rf.updateStatus(consts.FOLLOWER) {
+			utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[overdueRspCheck] 非法的状态转换,当前状态为%v,目标状态为%v", rf.getStatus(), consts.FOLLOWER)
+			return term, false
+		}
+		rf.updateTerm(term)
 	}
-	return true
+	return term, true
 }
 
 // 过期RPC响应检查
-func (rf *Raft) overdueRspCheck(rspTerm, nowTerm int) bool{
-	if rspTerm < nowTerm{
-		utils.Printf(consts.ERROR,rf.getEndName(rf.me),nowTerm,consts.NULL_OFFSET,"[overdueRspCheck] 响应任期小于预期任期,理论不可能,rspTerm=%v",rspTerm)
-	} else if rspTerm > nowTerm{
+func (rf *Raft) overdueRspCheckInLock(rspTerm, nowTerm int) bool {
+	if rspTerm < nowTerm {
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), nowTerm, consts.NULL_OFFSET, "[overdueRspCheck] 响应任期小于预期任期,理论不可能,rspTerm=%v", rspTerm)
+		return false
+	} else if rspTerm > nowTerm {
 		// 对方任期更高，回退为follower并修改任期
 		locks := utils.GetLockMap(consts.TERM, consts.STATUS)
-		utils.Printf(consts.INFO,rf.getEndName(rf.me),nowTerm,consts.NULL_OFFSET,"[overdueRspCheck] 收到高任期响应,回退为follower,修改任期为:%v",rspTerm)
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), nowTerm, consts.NULL_OFFSET, "[overdueRspCheck] 收到高任期响应,回退为follower,修改任期为:%v", rspTerm)
 		rf.lockMap.Lock(locks)
 		defer rf.lockMap.Unlock(locks)
 		if nowTerm != rf.term {
-			utils.Printf(consts.WARN,rf.getEndName(rf.me),rf.term,consts.NULL_OFFSET,"[overdueRspCheck] 任期改变,忽略本次响应")
+			utils.Printf(consts.WARN, rf.getEndName(rf.me), rf.term, consts.NULL_OFFSET, "[overdueRspCheck] 任期改变,忽略本次响应")
 			return false
 		}
-		if !rf.updateStatus(consts.FOLLOWER){
-			utils.Printf(consts.ERROR,rf.getEndName(rf.me),nowTerm,consts.NULL_OFFSET,"[overdueRspCheck] 非法的状态转换,当前状态为%v,目标状态为%v",rf.getStatus(),consts.FOLLOWER)
+		if !rf.updateStatus(consts.FOLLOWER) {
+			utils.Printf(consts.ERROR, rf.getEndName(rf.me), nowTerm, consts.NULL_OFFSET, "[overdueRspCheck] 非法的状态转换,当前状态为%v,目标状态为%v", rf.getStatus(), consts.FOLLOWER)
 			return false
 		}
 		rf.updateTerm(rspTerm)
-		return false
 	}
 	return true
 }
 
 // 任期相关
 // 获取任期
-func (rf *Raft) getTerm() int{
+func (rf *Raft) getTerm() int {
 	return rf.term
 }
 
 // 上锁获取任期
-func (rf *Raft) getTermInLock() int{
+func (rf *Raft) getTermInLock() int {
 	locks := utils.GetLockMap(consts.TERM)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
@@ -423,12 +580,12 @@ func (rf *Raft) getTermInLock() int{
 }
 
 // 上锁修改任期和voteFor
-func (rf *Raft) updateTermByCASInLock(target int, old int) bool{
-	locks := utils.GetLockMap(consts.TERM,consts.LOG)
+func (rf *Raft) updateTermByCASInLock(target int, old int) bool {
+	locks := utils.GetLockMap(consts.TERM, consts.LOG)
 	rf.lockMap.Lock(locks)
 	//var(
-		//offset = len(rf.logs)
-		//term = rf.getTerm()
+	//offset = len(rf.logs)
+	//term = rf.getTerm()
 	//)
 	defer func() {
 		rf.lockMap.Unlock(locks)
@@ -436,25 +593,26 @@ func (rf *Raft) updateTermByCASInLock(target int, old int) bool{
 	}()
 
 	//utils.ShowLockLog(consts.INFO,rf.getEndName(rf.me),term,offset,"[modTermByCASInLock]",locks)
-	return rf.updateTermByCAS(target,old)
+	return rf.updateTermByCAS(target, old)
 }
 
-func (rf *Raft) updateTermByCAS(target int , old int) bool{
-	if rf.term == old{
+func (rf *Raft) updateTermByCAS(target int, old int) bool {
+	if rf.term == old {
 		rf.updateTerm(target)
 		return true
 	}
+	utils.Printf(consts.WARN, rf.getEndName(rf.me), rf.term, consts.NULL_OFFSET, "[updateTermByCAS] 任期修改失败,原任期为%v,目标任期为%v", old, target)
 	return false
 }
 
-func (rf *Raft) updateTerm(target int){
+func (rf *Raft) updateTerm(target int) {
 	rf.term = target
 	rf.voteFor = consts.NULL_CAN
 }
 
 // 日志相关
-func (rf *Raft) getLogLenInLock() int{
-	var(
+func (rf *Raft) getLogLenInLock() int {
+	var (
 		locks = utils.GetLockMap(consts.LOG)
 	)
 	rf.lockMap.Lock(locks)
@@ -462,29 +620,29 @@ func (rf *Raft) getLogLenInLock() int{
 	return rf.getLogLen()
 }
 
-func (rf *Raft) getLogLen() int{
+func (rf *Raft) getLogLen() int {
 	return len(rf.logs)
 }
+
 //status相关
-func (rf *Raft) getStatus() consts.Status{
+func (rf *Raft) getStatus() consts.Status {
 	return rf.status
 }
 
 //状态转换
-func (rf *Raft) updateStatusByCASInLock(targetStatus consts.Status, oldTerm int) bool{
-	locks := utils.GetLockMap(consts.STATUS,consts.TERM)
+func (rf *Raft) updateStatusByCASInLock(targetStatus consts.Status, oldTerm int) bool {
+	locks := utils.GetLockMap(consts.STATUS, consts.TERM)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
-	if rf.getTerm() == oldTerm{
+	if rf.getTerm() == oldTerm {
 		return rf.updateStatus(targetStatus)
 	}
 	return false
 }
 
-
-func (rf *Raft) updateStatus(targetStatus consts.Status) bool{
+func (rf *Raft) updateStatus(targetStatus consts.Status) bool {
 	status := rf.getStatus()
-	if utils.CanTran(status,targetStatus){
+	if utils.CanTran(status, targetStatus) {
 		rf.status = targetStatus
 		return true
 	}
@@ -493,10 +651,10 @@ func (rf *Raft) updateStatus(targetStatus consts.Status) bool{
 
 // peers相关
 func (rf *Raft) getEndName(idx int) string {
-	if idx > len(rf.peers){
+	if idx > len(rf.peers) {
 		return "undefined"
 	}
-	return fmt.Sprintf("raft%v",idx)
+	return fmt.Sprintf("raft%v", idx)
 }
 
 // 选举相关
@@ -509,84 +667,123 @@ func (rf *Raft) heartBeat() {
 		}
 		// 不是leader才检测
 		term, status, _, _ := rf.getPrimeInfoInLock()
-		if status != consts.LEADER{
+		if status != consts.LEADER && !rf.overtimeCheck() {
 			// 检测不通过开始发起选举
-			if !rf.overtimeCheck() {
-				rf.startVote(term)
-			}
+			rf.startVote(term)
 		}
-		time.Sleep(time.Millisecond*consts.HEARTBEAT_TIME)
+		time.Sleep(time.Millisecond * consts.HEARTBEAT_TIME)
+	}
+}
+
+// 发送心跳
+func (rf *Raft) sendHeart(followerIdx int, startTerm int) {
+
+	for {
+		term, status, offset, me := rf.getPrimeInfoInLock()
+		if rf.killed() || term != startTerm || status != consts.LEADER {
+			utils.Printf(consts.INFO, rf.getEndName(me), term, offset, "[sendHeart] exit, startTerm=%v", startTerm)
+			return
+		}
+		utils.Printf(consts.DEBUG, rf.getEndName(me), term, offset, "[sendHeart] 开始向%v发送心跳", followerIdx)
+		go rf.SendAppendEntries(followerIdx, startTerm)
+		time.Sleep(consts.HEART_TIME * time.Millisecond)
 	}
 }
 
 // 发起选举
-func (rf *Raft) startVote(oldTerm int){
+func (rf *Raft) startVote(oldTerm int) {
 	var (
-		term int
-		status consts.Status
-		locks = utils.GetLockMap(consts.STATUS, consts.TERM)
-		successVoteCnt int32 = 0
-		failVoteCnt int32 = 0
-		slaveCnt = len(rf.peers)
-		targetCnt int32 = int32(slaveCnt)/2+1
-		timeout time.Time
+		term           int
+		status         consts.Status
+		locks                = utils.GetLockMap(consts.STATUS, consts.TERM, consts.LOG)
+		successVoteCnt int32 = 1
+		failVoteCnt    int32 = 0
+		slaveCnt             = len(rf.peers)
+		targetCnt      int32 = int32(slaveCnt)/2 + 1
+		timeout        time.Time
+		idx            = 0
+		lastLogIdx     = -1
+		lastLogTerm    = -1
+		success        bool
 	)
 	rf.lockMap.Lock(locks)
 	status = rf.getStatus()
 	term = rf.getTerm()
+	idx = rf.getLogLen() - 1
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getLogLen(), "[startVote] 开始发起选举")
+	if idx > 0 {
+		lastLogIdx = rf.logs[idx].Index
+		lastLogTerm = rf.logs[idx].Term
+	}
 	// 发生状态改变,返回
-	if oldTerm != term{
+	if oldTerm != term {
 		return
 	}
 	if !rf.updateStatus(consts.CANDIDATE) {
-		utils.Printf(consts.ERROR,rf.getEndName(rf.me),term,consts.NULL_OFFSET,"[startVote] 非法的状态转换,当前状态为%v,目标状态为%v",status,consts.CANDIDATE)
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[startVote] 非法的状态转换,当前状态为%v,目标状态为%v", status, consts.CANDIDATE)
 		rf.lockMap.Unlock(locks)
 		return
 	}
 	// 增加任期
-	rf.updateTerm(oldTerm+1)
+	term++
+	rf.updateTerm(term)
 	// 为自己投票
 	rf.updateVoteFor(rf.me)
 	// 更新选举超时
 	timeout = rf.updateElectionTime()
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getLogLen(), "[startVote] 更新选举超时为%v", timeout)
 	rf.lockMap.Unlock(locks)
 	// 并行开始请求选票
 	// 选票计数
 	for i := 0; i < slaveCnt; i++ {
+		slaveId := i
 		go func() {
+			if slaveId == rf.me {
+				return
+			}
 			var (
-				args = &RequestVoteArgs{}
+				args = &RequestVoteArgs{
+					Term:         term,
+					CandidateId:  rf.me,
+					LastLogIndex: lastLogIdx,
+					LastLogTerm:  lastLogTerm,
+				}
 				reply = &RequestVoteReply{}
 			)
-			rf.RequestVote(args,reply)
-			// 收到选票+1
-			if reply.voteGranted{
-				atomic.AddInt32(&successVoteCnt,1)
+			if ok := rf.sendRequestVote(slaveId, args, reply); !ok {
+				atomic.AddInt32(&failVoteCnt, 1)
 				return
 			}
 			// 过期任期检测
-			rf.overdueRspCheck(reply.term,term)
-			atomic.AddInt32(&failVoteCnt,1)
+			if ok := rf.overdueRspCheckInLock(reply.Term, term); !ok {
+				atomic.AddInt32(&failVoteCnt, 1)
+				return
+			}
+			// 收到选票+1
+			if reply.VoteGranted {
+				atomic.AddInt32(&successVoteCnt, 1)
+				return
+			}
+			atomic.AddInt32(&failVoteCnt, 1)
 		}()
 	}
 	for {
 		locks = utils.GetLockMap(consts.TERM)
 		rf.lockMap.Lock(locks)
 		// 当前rf死亡/任期改变/超时/出现结果就立即返回
-		if rf.killed() || rf.getTerm() != term || time.Now().Before(timeout) || atomic.LoadInt32(&successVoteCnt) >= targetCnt || atomic.LoadInt32(&failVoteCnt) >= targetCnt{
+		if rf.killed() || rf.getTerm() != term || time.Now().After(timeout) || atomic.LoadInt32(&successVoteCnt) >= targetCnt || atomic.LoadInt32(&failVoteCnt) >= targetCnt {
 			rf.lockMap.Unlock(locks)
 			break
 		}
 		rf.lockMap.Unlock(locks)
-		time.Sleep(consts.WAIT_VOTE_TIME*time.Millisecond)
+		time.Sleep(consts.WAIT_VOTE_TIME * time.Millisecond)
 	}
-	if atomic.LoadInt32(&successVoteCnt) < targetCnt {
-		return
+	if atomic.LoadInt32(&successVoteCnt) >= targetCnt {
+		// 成功当选, 晋升为leader
+		term, success = rf.promoteLeader(term)
 	}
-	// 成功当选, 晋升为leader并立即发送心跳
-	success := rf.promoteLeader(term)
-	if success{
-		rf.initLeader()
+	if success {
+		rf.initLeader(term)
 	} else {
 		// 回退为follower
 		rf.rollbackFollower(term)
@@ -594,73 +791,176 @@ func (rf *Raft) startVote(oldTerm int){
 }
 
 // 尝试晋升为leader
-func (rf *Raft) promoteLeader(oldTerm int) bool{
-	locks := utils.GetLockMap(consts.TERM, consts.STATUS)
+func (rf *Raft) promoteLeader(oldTerm int) (int, bool) {
+	locks := utils.GetLockMap(consts.TERM, consts.STATUS, consts.NEXT_INDEX, consts.MATCH_INDEX, consts.LOG)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
 	term := rf.getTerm()
-	utils.Printf(consts.INFO,rf.getEndName(rf.me),term,consts.NULL_OFFSET,"[promoteLeader] 开始晋升leader")
-	success := utils.OperationByCAS(term,oldTerm, func() bool{
+	logLen := rf.getLogLen()
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[promoteLeader] 开始晋升leader")
+	success := utils.OperationByCAS(term, oldTerm, func() bool {
 		if !rf.updateStatus(consts.LEADER) {
 			return false
 		}
 		return true
 	})
-	if !success{
-		utils.Printf(consts.WARN,rf.getEndName(rf.me),term,consts.NULL_OFFSET,"[promoteLeader] 晋升失败,当前状态为%v",rf.status.String())
+	if !success {
+		utils.Printf(consts.WARN, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[promoteLeader] 晋升失败,当前状态为%v", rf.status.String())
+		return term, success
 	}
-	return success
+	// 初始化matchIndex和nextIndex
+	for i := 0; i < len(rf.peers); i++ {
+		rf.updateNextIndex(i, logLen, true)
+		rf.updateMatchIndex(i, 0, term)
+	}
+	return term, success
 }
 
 // 回退为follower
-func (rf *Raft) rollbackFollower(oldTerm int) bool{
-	locks := utils.GetLockMap(consts.TERM,consts.STATUS)
+func (rf *Raft) rollbackFollower(oldTerm int) bool {
+	locks := utils.GetLockMap(consts.TERM, consts.STATUS)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
 	term := rf.getTerm()
-	utils.Printf(consts.INFO,rf.getEndName(rf.me),term,consts.NULL_OFFSET,"[rollbackFollower] 选举失败,回退为follower")
-	success := utils.OperationByCAS(term,oldTerm, func() bool{
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[rollbackFollower] 选举失败,回退为follower")
+	success := utils.OperationByCAS(term, oldTerm, func() bool {
 		if !rf.updateStatus(consts.FOLLOWER) {
 			return false
 		}
 		return true
 	})
-	if !success{
-		utils.Printf(consts.WARN,rf.getEndName(rf.me),term,consts.NULL_OFFSET,"[rollbackFollower] 回退失败,当前状态为%v",rf.status.String())
+	if !success {
+		utils.Printf(consts.WARN, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[rollbackFollower] 回退失败,当前状态为%v,oldTerm=%v", rf.status.String(), oldTerm)
 	}
 	return success
 }
 
 // leader初始化
-func (rf *Raft) initLeader(){
+func (rf *Raft) initLeader(term int) {
 	// 立即发送心跳并定期发送
-
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendHeart(i, term)
+	}
 }
 
-func (rf *Raft) getElectionTime() time.Time{
+func (rf *Raft) getElectionTime() time.Time {
 	t := rf.electionTime.Load().(time.Time)
 	return t
 }
 
 // 更新选举超时
-func (rf *Raft) updateElectionTime() time.Time{
+func (rf *Raft) updateElectionTime() time.Time {
 	now := time.Now()
-	now.Add(time.Duration(consts.ELECTION_TIME)*time.Millisecond)
-	rf.electionTime.Store(now)
-	return now
+	millSec := consts.ELECTION_TIME + rand.Intn(consts.ELECTION_TIME)
+	next := now.Add(time.Duration(millSec) * time.Millisecond)
+	rf.electionTime.Store(next)
+	return next
 }
 
 // 超时检测, true通过检测,false不通过
-func (rf *Raft) overtimeCheck() bool{
+func (rf *Raft) overtimeCheck() bool {
 	t := rf.getElectionTime()
 	return time.Now().Before(t)
 }
 
-func (rf *Raft) updateVoteFor(idx int){
+func (rf *Raft) updateVoteFor(idx int) {
 	rf.voteFor = idx
 }
 
 // commitIndex
-func (rf *Raft) getCommitIndex() int32{
+func (rf *Raft) getCommitIndex() int32 {
 	return atomic.LoadInt32(&rf.commitIndex)
+}
+
+// 协程执行的修改函数必须确定协程创建时的任期,因为不知道会何时执行
+func (rf *Raft) updateCommitIndex(oldTerm int) {
+	locks := utils.GetLockMap(consts.MATCH_INDEX, consts.TERM, consts.STATUS, consts.LOG, consts.LAST_APPLIED)
+	rf.lockMap.Lock(locks)
+	defer rf.lockMap.Unlock(locks)
+	var (
+		status = rf.getStatus()
+		term   = rf.getTerm()
+		//logLen = rf.getLogLen()
+		offset = rf.getOffset()
+		matchs = make([]int, len(rf.matchIndex))
+	)
+	if rf.killed() || status != consts.LEADER {
+		return
+	}
+	utils.OperationByCAS(term, oldTerm, func() bool {
+		copy(matchs, rf.matchIndex)
+		sort.Ints(matchs)
+		targetIdx := matchs[len(matchs)/2]
+		if targetIdx > offset {
+			utils.Printf(consts.ERROR, rf.getEndName(rf.me), targetIdx, offset, "[updateCommitIndex] targetIndex > offset,targetIndex=%v", targetIdx)
+			return false
+		}
+		log := rf.logs[targetIdx]
+		if log.Term != term {
+			utils.Printf(consts.WARN, rf.getEndName(rf.me), targetIdx, offset, "[updateCommitIndex] %v偏移量的日志任期不等于当前任期，该日志任期为%v", targetIdx, log.Term)
+		}
+		// 修改commitIndex
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), targetIdx, offset, "[updateCommitIndex] 修改commitIndex为%v", targetIdx)
+		atomic.StoreInt32(&rf.commitIndex, int32(targetIdx))
+		// 响应已提交的日志
+		for i := rf.lastApplied + 1; i <= rf.getCommitIndex(); i++ {
+			if i > int32(offset) {
+				utils.Printf(consts.FATAL, rf.getEndName(rf.me), term, offset, "[updateCommitIndex] 尝试响应不存在的日志,期望偏移量为%v", rf.lastApplied)
+			}
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i].Command,
+				CommandIndex: rf.logs[i].Index,
+			}
+			rf.applyCh <- applyMsg
+			rf.lastApplied = i
+			utils.Printf(consts.INFO, rf.getEndName(rf.me), term, offset, "[AppendEntries] 提交日志%v", applyMsg)
+			// lab3的时候需要优化下，当日志系统感知到kv服务器应用该日志并
+		}
+		return true
+	})
+}
+
+func (rf *Raft) appendLog(term, index int, command interface{}) {
+	log := &entity.Log{
+		Term:    term,
+		Index:   index,
+		Command: command,
+	}
+	rf.logs = append(rf.logs, log)
+	utils.Printf(consts.DEBUG, rf.getEndName(rf.me), term, index, "[appendLog] 新增日志%v", log)
+}
+
+func (rf *Raft) updateNextIndex(slaveId, targetIndex int, canBack bool) bool {
+	if !canBack && targetIndex <= rf.getNextIndex(slaveId) {
+		return false
+	}
+	rf.nextIndex[slaveId] = targetIndex
+	utils.Printf(consts.INFO, rf.getEndName(rf.me), rf.term, rf.getOffset(), "[updateNextIndex] 修改next[%v]=%v", slaveId, targetIndex)
+	return true
+}
+
+func (rf *Raft) getNextIndex(slaveId int) int {
+	return rf.nextIndex[slaveId]
+}
+
+func (rf *Raft) updateMatchIndex(slaveId, targetIdx, term int) bool {
+	if targetIdx <= rf.getMatchIndex(slaveId) {
+		return false
+	}
+	rf.matchIndex[slaveId] = targetIdx
+	utils.Printf(consts.DEBUG, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[updateMatchIndex] 修改matchIndex[%v]=%v", slaveId, targetIdx)
+	go rf.updateCommitIndex(term)
+	return true
+}
+
+func (rf *Raft) getMatchIndex(slaveId int) int {
+	return rf.matchIndex[slaveId]
+}
+
+func (rf *Raft) getOffset() int {
+	return rf.getLogLen() - 1
 }
