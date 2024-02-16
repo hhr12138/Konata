@@ -222,7 +222,7 @@ func (rf *Raft) SendAppendEntries(slaveId int, oldTerm int) {
 		prevLogTerm  = -1
 	)
 	if logStartIdx > logLen {
-		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[RequestAppendEntries] 期望的nextIndex>主节点最大偏移量,slaveId=%v", slaveId)
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[RequestAppendEntries] 期望的nextIndex>主节点最大偏移量,slaveId=%v，nextIndex=%v", slaveId, logStartIdx)
 		logStartIdx = logLen
 	}
 	appendLogs := rf.logs[logStartIdx:logLen]
@@ -315,7 +315,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 	// prevLogIndex检测
 	if args.PrevLogTerm != prevLogTerm {
 		reply.Success = false
-		if args.PrevLogIndex < logLen {
+		if args.PrevLogIndex > logLen {
 			reply.NextIndex = logLen
 			reply.LogTerm = logTerm
 		} else {
@@ -329,8 +329,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 	for i := 0; i < len(args.Entries) && args.Entries[i].Index < logLen; i++ {
 		if args.Entries[i].Term != rf.logs[args.Entries[i].Index].Term {
 			// 日志冲突,截断
-			rf.logs = rf.logs[:args.Entries[i].Index]
 			utils.Printf(consts.WARN, rf.getEndName(rf.me), term, offset, "[AppendEntries] 在idx=%v出日志冲突,参数任期为%v,当前节点任期为%v,截断", args.Entries[i].Index, args.Entries[i].Term, rf.logs[args.Entries[i].Index].Term)
+			rf.logs = rf.logs[:args.Entries[i].Index]
 			break
 		} else { //存在当前日志，不copy
 			startCopyIdx = i + 1
@@ -430,7 +430,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	)
 
 	// Your code here (2B).
-	locks := utils.GetLockMap(consts.LOG, consts.TERM)
+	locks := utils.GetLockMap(consts.LOG, consts.TERM, consts.MATCH_INDEX)
 	rf.lockMap.Lock(locks)
 	defer rf.lockMap.Unlock(locks)
 	status = rf.getStatus()
@@ -440,6 +440,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.getTerm()
 	index = rf.getLogLen()
 	rf.appendLog(term, index, command)
+	rf.updateMatchIndex(rf.me, index, term)
 	// 同步日志
 	go func() {
 		for i := 0; i < len(rf.peers); i++ {
@@ -899,8 +900,9 @@ func (rf *Raft) updateCommitIndex(oldTerm int) {
 			return false
 		}
 		log := rf.logs[targetIdx]
-		if log.Term != term {
+		if log.Term != term { // 仅提交当前任期偏移量
 			utils.Printf(consts.WARN, rf.getEndName(rf.me), targetIdx, offset, "[updateCommitIndex] %v偏移量的日志任期不等于当前任期，该日志任期为%v", targetIdx, log.Term)
+			return false
 		}
 		// 修改commitIndex
 		utils.Printf(consts.INFO, rf.getEndName(rf.me), targetIdx, offset, "[updateCommitIndex] 修改commitIndex为%v", targetIdx)
