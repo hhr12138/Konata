@@ -33,7 +33,6 @@ import (
 // import "bytes"
 // import "../labgob"
 
-//
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -43,16 +42,13 @@ import (
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
 }
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -90,11 +86,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -106,9 +100,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -128,10 +120,8 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
@@ -140,19 +130,15 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
-//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
 	VoteGranted bool
 }
 
-//
 // example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	var (
@@ -321,7 +307,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 			reply.NextIndex = logLen
 			reply.LogTerm = logTerm
 		} else {
-			reply.NextIndex = args.PrevLogIndex
+			// 加速回溯优化
+			reply.NextIndex = rf.findFirstLogByTerm(prevLogTerm)
 			reply.LogTerm = prevLogTerm
 		}
 		utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, offset, "[AppendEntries] 日志冲突,对于idx=%v的日志,参数任期为%v,当前节点日志为%v", args.PrevLogIndex, args.PrevLogTerm, prevLogTerm)
@@ -370,7 +357,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 	return
 }
 
-//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -398,7 +384,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -410,7 +395,6 @@ func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *Re
 	return ok
 }
 
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -423,7 +407,6 @@ func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *Re
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	var (
 		index  = -1
@@ -455,7 +438,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, true
 }
 
-//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -465,7 +447,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -476,7 +457,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -486,7 +466,6 @@ func (rf *Raft) killed() bool {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -534,9 +513,9 @@ func (rf *Raft) overdueReqCheck(argTerm int) (int, bool) {
 	} else if argTerm > term {
 		term = argTerm
 		// 对方任期更高，回退为follower并修改任期
-		utils.Printf(consts.INFO, rf.getEndName(rf.me), rf.getTerm(), consts.NULL_OFFSET, "[overdueRspCheck] 收到高任期请求,回退为follower,修改任期为:%v", argTerm)
+		utils.Printf(consts.INFO, rf.getEndName(rf.me), rf.getTerm(), consts.NULL_OFFSET, "[overdueReqCheck] 收到高任期请求,回退为follower,修改任期为:%v", argTerm)
 		if !rf.updateStatus(consts.FOLLOWER) {
-			utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[overdueRspCheck] 非法的状态转换,当前状态为%v,目标状态为%v", rf.getStatus(), consts.FOLLOWER)
+			utils.Printf(consts.ERROR, rf.getEndName(rf.me), term, consts.NULL_OFFSET, "[overdueReqCheck] 非法的状态转换,当前状态为%v,目标状态为%v", rf.getStatus(), consts.FOLLOWER)
 			return term, false
 		}
 		rf.updateTerm(term)
@@ -590,10 +569,7 @@ func (rf *Raft) updateTermByCASInLock(target int, old int) bool {
 	//offset = len(rf.logs)
 	//term = rf.getTerm()
 	//)
-	defer func() {
-		rf.lockMap.Unlock(locks)
-		//utils.ShowUnlockLog(consts.INFO,rf.getEndName(rf.me),term,offset,"[modTermByCASInLock]",locks)
-	}()
+	defer rf.lockMap.Unlock(locks)
 
 	//utils.ShowLockLog(consts.INFO,rf.getEndName(rf.me),term,offset,"[modTermByCASInLock]",locks)
 	return rf.updateTermByCAS(target, old)
@@ -627,12 +603,12 @@ func (rf *Raft) getLogLen() int {
 	return len(rf.logs)
 }
 
-//status相关
+// status相关
 func (rf *Raft) getStatus() consts.Status {
 	return rf.status
 }
 
-//状态转换
+// 状态转换
 func (rf *Raft) updateStatusByCASInLock(targetStatus consts.Status, oldTerm int) bool {
 	locks := utils.GetLockMap(consts.STATUS, consts.TERM)
 	rf.lockMap.Lock(locks)
@@ -727,6 +703,7 @@ func (rf *Raft) startVote(oldTerm int) {
 	}
 	// 发生状态改变,返回
 	if oldTerm != term {
+		rf.lockMap.Unlock(locks)
 		return
 	}
 	if !rf.updateStatus(consts.CANDIDATE) {
@@ -974,4 +951,25 @@ func (rf *Raft) getMatchIndex(slaveId int) int {
 
 func (rf *Raft) getOffset() int {
 	return rf.getLogLen() - 1
+}
+
+// 二分查找任期等于指定任期的第一个日志
+func (rf *Raft) findFirstLogByTerm(term int) int {
+	var (
+		left   = 0
+		offset = rf.getOffset()
+		right  = offset
+	)
+	for left <= right {
+		mid := (left + right) >> 1
+		if rf.logs[mid].Term >= term {
+			right = mid - 1
+		} else {
+			left = mid + 1
+		}
+	}
+	if right >= offset || rf.logs[right+1].Term != term {
+		utils.Printf(consts.ERROR, rf.getEndName(rf.me), rf.getTerm(), offset, "[findFirstLogByTerm] 返回偏移量大于最大偏移量，不应当存在，返回偏移量为%v", right+1)
+	}
+	return right + 1
 }
