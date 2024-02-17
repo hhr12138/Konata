@@ -187,6 +187,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] 为%v投票", rf.getEndName(args.CandidateId))
 	rf.voteFor = args.CandidateId
+	// 授予投票后也需要重置选举超时
+	rf.updateElectionTime()
 	reply.VoteGranted = true
 }
 
@@ -428,7 +430,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term   = -1
 		status = consts.FOLLOWER
 	)
-
+	utils.Printf(consts.DEBUG, rf.getEndName(rf.me), -1, consts.NULL_OFFSET, "开始增添日志%v", command)
 	// Your code here (2B).
 	locks := utils.GetLockMap(consts.LOG, consts.TERM, consts.MATCH_INDEX)
 	rf.lockMap.Lock(locks)
@@ -667,8 +669,15 @@ func (rf *Raft) heartBeat() {
 			return
 		}
 		// 不是leader才检测
-		term, status, _, _ := rf.getPrimeInfoInLock()
-		if status != consts.LEADER && !rf.overtimeCheck() {
+		locks := utils.GetLockMap(consts.TERM, consts.STATUS)
+		rf.lockMap.Lock(locks)
+		var (
+			term   = rf.getTerm()
+			status = rf.getStatus()
+			over   = rf.overtimeCheck()
+		)
+		rf.lockMap.Unlock(locks)
+		if status != consts.LEADER && !over {
 			// 检测不通过开始发起选举
 			rf.startVote(term)
 		}
