@@ -1,9 +1,11 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/hhr12138/Konata/src/consts"
 	"github.com/hhr12138/Konata/src/entity"
+	"github.com/hhr12138/Konata/src/labgob"
 	"github.com/hhr12138/Konata/src/labrpc"
 	"github.com/hhr12138/Konata/src/utils"
 	"math/rand"
@@ -89,7 +91,8 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-func (rf *Raft) persist() {
+// 需要任期锁以及日志锁
+func (rf *Raft) persist(fieldName consts.FieldName) {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -97,7 +100,38 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	//rf.persister.SaveRaftState(data)
+
+	var (
+		raft = new(entity.PersistRaft)
+		err  error
+	)
+	state := rf.persister.ReadRaftState()
+	//不要用json包。。。json包会把logs[i].command里的index反序列化为float64，导致和int类型比较不通过
+	if state != nil {
+		//err = json.Unmarshal(state, raft)
+		r := bytes.NewBuffer(state)
+		d := labgob.NewDecoder(r)
+		err = d.Decode(&raft)
+	}
+	if err != nil {
+		msg := fmt.Sprintf("[persist] unmarshal fail, state: %v, error: %v", state, err)
+		// 需要保证强一致性，直接panic
+		panic(msg)
+	}
+	switch fieldName {
+	case consts.PersistTerm, consts.PersistVoteFor:
+		raft.Term = rf.term
+		raft.VoteFor = rf.voteFor
+	case consts.PersistLogs:
+		raft.Logs = rf.logs
+	}
+	//bs, _ := json.Marshal(raft)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(raft)
+	bs := w.Bytes()
+	rf.persister.SaveRaftState(bs)
 }
 
 // restore previously persisted state.
@@ -105,6 +139,26 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+	//不要用json包。。。json包会把logs[i].command里的index反序列化为float64，导致和int类型比较不通过
+	var (
+		raft = new(entity.PersistRaft)
+		err  error
+	)
+	//err = json.Unmarshal(data, raft)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	err = d.Decode(&raft)
+	if err != nil {
+		msg := fmt.Sprintf("[readPersist] unmarshal fail, state: %v, error: %v", data, err)
+		// 需要保证强一致性，直接panic
+		panic(msg)
+	}
+	rf.term = raft.Term
+	rf.voteFor = raft.VoteFor
+	if len(raft.Logs) > 0 {
+		rf.logs = raft.Logs
+	}
+
 	// Your code here (2C).
 	// Example:
 	// r := bytes.NewBuffer(data)
@@ -172,7 +226,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	utils.Printf(consts.INFO, rf.getEndName(rf.me), term, rf.getOffset(), "[RequestVote] 为%v投票", rf.getEndName(args.CandidateId))
-	rf.voteFor = args.CandidateId
+	rf.updateVoteFor(args.CandidateId)
 	// 授予投票后也需要重置选举超时
 	rf.updateElectionTime()
 	reply.VoteGranted = true
@@ -319,14 +373,14 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 		if args.Entries[i].Term != rf.logs[args.Entries[i].Index].Term {
 			// 日志冲突,截断
 			utils.Printf(consts.WARN, rf.getEndName(rf.me), term, offset, "[AppendEntries] 在idx=%v出日志冲突,参数任期为%v,当前节点任期为%v,截断", args.Entries[i].Index, args.Entries[i].Term, rf.logs[args.Entries[i].Index].Term)
-			rf.logs = rf.logs[:args.Entries[i].Index]
+			rf.truncationLog(args.Entries[i].Index)
 			break
 		} else { //存在当前日志，不copy
 			startCopyIdx = i + 1
 		}
 	}
 	// 追加日志
-	rf.logs = append(rf.logs, args.Entries[startCopyIdx:]...)
+	rf.appendLog(term, offset, args.Entries[startCopyIdx:]...)
 	logLen = rf.getLogLen()
 	offset = rf.getOffset()
 	// 修改commitIndex
@@ -424,7 +478,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	term = rf.getTerm()
 	index = rf.getLogLen()
-	rf.appendLog(term, index, command)
+	rf.appendLog(term, index, &entity.Log{
+		Index:   index,
+		Term:    term,
+		Command: command,
+	})
 	rf.updateMatchIndex(rf.me, index, term)
 	// 同步日志
 	go func() {
@@ -477,8 +535,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lockMap = make(map[consts.LockName]*sync.Mutex, len(consts.LockOrder))
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	rf.logs = make([]*entity.Log, 0)
-	rf.logs = append(rf.logs, &entity.Log{})
+	// 不能appendLog，appendLog会将当前这个未初始化完成的rf给持久化
+	rf.logs = []*entity.Log{
+		{
+			Index:   0,
+			Term:    0,
+			Command: nil,
+		},
+	}
 	rf.electionTime.Store(time.Now())
 
 	rf.lockMap.InitLocks()
@@ -587,6 +651,7 @@ func (rf *Raft) updateTermByCAS(target int, old int) bool {
 func (rf *Raft) updateTerm(target int) {
 	rf.term = target
 	rf.voteFor = consts.NULL_CAN
+	rf.persist(consts.PersistTerm)
 }
 
 // 日志相关
@@ -855,6 +920,7 @@ func (rf *Raft) overtimeCheck() bool {
 
 func (rf *Raft) updateVoteFor(idx int) {
 	rf.voteFor = idx
+	rf.persist(consts.PersistVoteFor)
 }
 
 // commitIndex
@@ -903,23 +969,26 @@ func (rf *Raft) updateCommitIndex(oldTerm int) {
 				Command:      rf.logs[i].Command,
 				CommandIndex: rf.logs[i].Index,
 			}
+			utils.Printf(consts.INFO, rf.getEndName(rf.me), term, offset, "[AppendEntries] 提交日志%v", applyMsg)
 			rf.applyCh <- applyMsg
 			rf.lastApplied = i
-			utils.Printf(consts.INFO, rf.getEndName(rf.me), term, offset, "[AppendEntries] 提交日志%v", applyMsg)
 			// lab3的时候需要优化下，当日志系统感知到kv服务器应用该日志并
 		}
 		return true
 	})
 }
 
-func (rf *Raft) appendLog(term, index int, command interface{}) {
-	log := &entity.Log{
-		Term:    term,
-		Index:   index,
-		Command: command,
+func (rf *Raft) appendLog(term, index int, logs ...*entity.Log) {
+	rf.logs = append(rf.logs, logs...)
+	for _, log := range logs {
+		utils.Printf(consts.DEBUG, rf.getEndName(rf.me), term, index, "[appendLog] 追加日志%v", log)
 	}
-	rf.logs = append(rf.logs, log)
-	utils.Printf(consts.DEBUG, rf.getEndName(rf.me), term, index, "[appendLog] 新增日志%v", log)
+	rf.persist(consts.PersistLogs)
+}
+
+func (rf *Raft) truncationLog(end int) {
+	rf.logs = rf.logs[:end]
+	rf.persist(consts.PersistLogs)
 }
 
 func (rf *Raft) updateNextIndex(slaveId, targetIndex int, canBack bool) bool {

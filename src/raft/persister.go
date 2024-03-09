@@ -12,7 +12,8 @@ package raft
 import "sync"
 
 type Persister struct {
-	mu        sync.Mutex
+	mu sync.Mutex
+	// 模拟实现，真实实现的话，votefor和term记录在一个文件中，通过写入新文件+原子性重命名的方式保证原子性，然后log通过原子追加命令保证
 	raftstate []byte
 	snapshot  []byte
 }

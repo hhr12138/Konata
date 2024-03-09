@@ -14,7 +14,7 @@ const (
 	FATAL LogLevel = "FATAL"
 )
 
-const(
-	NULL_CAN = -1
+const (
+	NULL_CAN    = -1
 	NULL_OFFSET = -1
 )
